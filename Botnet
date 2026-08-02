@@ -1,19 +1,29 @@
 @echo off
-title TITO Load Tester v2.0
+title TITO Load Tester
 color 0A
 cd /d "%~dp0"
 
 where python >nul 2>nul
-if errorlevel 1 (
-    echo [ERRO] Python nao encontrado. Instale em https://www.python.org/downloads/
-    echo        Marque a opcao "Add Python to PATH" na instalacao.
-    pause
-    exit /b 1
-)
+if not errorlevel 1 goto run_python
 
+where py >nul 2>nul
+if not errorlevel 1 goto run_py
+
+echo [ERRO] Python nao encontrado.
+echo Instale em https://www.python.org/downloads/ e marque "Add Python to PATH".
+pause
+exit /b 1
+
+:run_python
 python tito.py
+goto fim
+
+:run_py
+py -3 tito.py
+
+:fim
 if errorlevel 1 (
     echo.
-    echo [ERRO] Falha ao executar o script.
-    pause
+    echo [ERRO] Falha ao executar o script. Veja a mensagem acima.
 )
+pause
